@@ -47,6 +47,7 @@ func TestProviderGetSecret(t *testing.T) {
 			name: "get secret successfully",
 			client: func() *onepassword.Client {
 				fc := &fakeClient{
+					listAllResult: []onepassword.VaultOverview{{ID: "vault-id", Title: "vault"}},
 					resolveResult: "secret",
 				}
 				return &onepassword.Client{
@@ -66,7 +67,8 @@ func TestProviderGetSecret(t *testing.T) {
 			name: "get secret with error",
 			client: func() *onepassword.Client {
 				fc := &fakeClient{
-					resolveError: errors.New("fobar"),
+					listAllResult: []onepassword.VaultOverview{{ID: "vault-id", Title: "vault"}},
+					resolveError:  errors.New("fobar"),
 				}
 				return &onepassword.Client{
 					SecretsAPI: fc,
@@ -84,6 +86,7 @@ func TestProviderGetSecret(t *testing.T) {
 			name: "get secret version not implemented",
 			client: func() *onepassword.Client {
 				fc := &fakeClient{
+					listAllResult: []onepassword.VaultOverview{{ID: "vault-id", Title: "vault"}},
 					resolveResult: "secret",
 				}
 				return &onepassword.Client{
@@ -590,6 +593,7 @@ func TestGetVault(t *testing.T) {
 
 type fakeLister struct {
 	listAllResult    []onepassword.ItemOverview
+	listErr          error
 	createCalled     bool
 	createdFieldType onepassword.ItemFieldType
 	createdParams    onepassword.ItemCreateParams
@@ -597,6 +601,7 @@ type fakeLister struct {
 	putItem          onepassword.Item
 	deleteCalled     bool
 	getResult        onepassword.Item
+	getErr           error
 	fileLister       onepassword.ItemsFilesAPI
 }
 
@@ -610,7 +615,7 @@ func (f *fakeLister) Create(ctx context.Context, params onepassword.ItemCreatePa
 }
 
 func (f *fakeLister) Get(ctx context.Context, vaultID, itemID string) (onepassword.Item, error) {
-	return f.getResult, nil
+	return f.getResult, f.getErr
 }
 
 func (f *fakeLister) Put(ctx context.Context, item onepassword.Item) (onepassword.Item, error) {
@@ -629,7 +634,7 @@ func (f *fakeLister) Archive(ctx context.Context, vaultID, itemID string) error 
 }
 
 func (f *fakeLister) List(ctx context.Context, vaultID string, opts ...onepassword.ItemListFilter) ([]onepassword.ItemOverview, error) {
-	return f.listAllResult, nil
+	return f.listAllResult, f.listErr
 }
 
 func (f *fakeLister) Shares() onepassword.ItemsSharesAPI {
@@ -828,9 +833,28 @@ func TestDeleteMultipleFieldsFromSameItem(t *testing.T) {
 }
 
 func TestCachingGetSecret(t *testing.T) {
+	getCacheContents := func(p *SecretsClient) map[string][]byte {
+		keys := p.cache.Keys()
+		m := make(map[string][]byte, len(keys))
+		for _, k := range keys {
+			v, _ := p.cache.Peek(k)
+			m[k] = v
+		}
+
+		return m
+	}
+
+	debugCacheContents := func(p *SecretsClient) {
+		fmt.Printf("cache contents:\n")
+		for k, v := range getCacheContents(p) {
+			fmt.Printf("  %s: %s\n", k, string(v))
+		}
+	}
+
 	t.Run("cache hit returns cached value", func(t *testing.T) {
 		fcWithCounter := &fakeClientWithCounter{
 			fakeClient: &fakeClient{
+				listAllResult: []onepassword.VaultOverview{{ID: "vault-id", Title: "vault"}},
 				resolveResult: "secret-value",
 			},
 		}
@@ -838,15 +862,20 @@ func TestCachingGetSecret(t *testing.T) {
 		p := &SecretsClient{
 			client: &onepassword.Client{
 				SecretsAPI: fcWithCounter,
-				VaultsAPI:  fcWithCounter.fakeClient,
+				VaultsAPI:  fcWithCounter,
 			},
 			vaultPrefix: "op://vault/",
 		}
 
 		// Initialize cache
 		p.cache = expirable.NewLRU[string, []byte](100, nil, time.Minute)
+		fmt.Println("BEFORE:")
+		debugCacheContents(p)
 
-		ref := v1.ExternalSecretDataRemoteRef{Key: "item/field"}
+		ref := v1.ExternalSecretDataRemoteRef{
+			Key:      "item",
+			Property: "field",
+		}
 
 		// First call - cache miss
 		val1, err := p.GetSecret(t.Context(), ref)
@@ -858,7 +887,10 @@ func TestCachingGetSecret(t *testing.T) {
 		val2, err := p.GetSecret(t.Context(), ref)
 		require.NoError(t, err)
 		assert.Equal(t, []byte("secret-value"), val2)
-		assert.Equal(t, 1, fcWithCounter.resolveCallCount, "API should not be called on cache hit")
+		assert.Equal(t, 2, fcWithCounter.resolveCallCount, "API should not be called on cache hit")
+
+		fmt.Println("AFTER:")
+		debugCacheContents(p)
 	})
 
 	t.Run("cache disabled works normally", func(t *testing.T) {
@@ -1193,6 +1225,70 @@ func (f *fakeListerWithCounter) Create(ctx context.Context, item onepassword.Ite
 	return f.fakeLister.Create(ctx, item)
 }
 
+// fakeFileListerWithCounter wraps fakeFileLister and tracks Read call count.
+type fakeFileListerWithCounter struct {
+	*fakeFileLister
+	readCallCount int
+}
+
+func (f *fakeFileListerWithCounter) Attach(ctx context.Context, item onepassword.Item, fileParams onepassword.FileCreateParams) (onepassword.Item, error) {
+	return onepassword.Item{}, nil
+}
+
+func (f *fakeFileListerWithCounter) Read(ctx context.Context, vaultID, itemID string, attr onepassword.FileAttributes) ([]byte, error) {
+	f.readCallCount++
+	return f.readContent, nil
+}
+
+func (f *fakeFileListerWithCounter) Delete(ctx context.Context, item onepassword.Item, sectionID, fieldID string) (onepassword.Item, error) {
+	return onepassword.Item{}, nil
+}
+
+func (f *fakeFileListerWithCounter) ReplaceDocument(ctx context.Context, item onepassword.Item, docParams onepassword.DocumentCreateParams) (onepassword.Item, error) {
+	return onepassword.Item{}, nil
+}
+
+// statefulFakeListerWithCounter wraps statefulFakeLister and tracks Get call count.
+type statefulFakeListerWithCounter struct {
+	*statefulFakeLister
+	getCallCount  int
+	listCallCount int
+}
+
+func (f *statefulFakeListerWithCounter) Get(ctx context.Context, vaultID, itemID string) (onepassword.Item, error) {
+	f.getCallCount++
+	return f.statefulFakeLister.Get(ctx, vaultID, itemID)
+}
+
+func (f *statefulFakeListerWithCounter) Put(ctx context.Context, item onepassword.Item) (onepassword.Item, error) {
+	return f.statefulFakeLister.Put(ctx, item)
+}
+
+func (f *statefulFakeListerWithCounter) Delete(ctx context.Context, vaultID, itemID string) error {
+	return f.statefulFakeLister.Delete(ctx, vaultID, itemID)
+}
+
+func (f *statefulFakeListerWithCounter) Archive(ctx context.Context, vaultID, itemID string) error {
+	return f.statefulFakeLister.Archive(ctx, vaultID, itemID)
+}
+
+func (f *statefulFakeListerWithCounter) List(ctx context.Context, vaultID string, opts ...onepassword.ItemListFilter) ([]onepassword.ItemOverview, error) {
+	f.listCallCount++
+	return f.statefulFakeLister.List(ctx, vaultID, opts...)
+}
+
+func (f *statefulFakeListerWithCounter) Shares() onepassword.ItemsSharesAPI {
+	return f.statefulFakeLister.Shares()
+}
+
+func (f *statefulFakeListerWithCounter) Files() onepassword.ItemsFilesAPI {
+	return f.statefulFakeLister.Files()
+}
+
+func (f *statefulFakeListerWithCounter) Create(ctx context.Context, item onepassword.ItemCreateParams) (onepassword.Item, error) {
+	return f.statefulFakeLister.Create(ctx, item)
+}
+
 var _ onepassword.SecretsAPI = &fakeClient{}
 var _ onepassword.VaultsAPI = &fakeClient{}
 var _ onepassword.ItemsAPI = &fakeLister{}
@@ -1461,6 +1557,475 @@ func TestIsNativeItemID(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGetAllSecrets(t *testing.T) {
+	item1 := onepassword.Item{
+		ID:       "item-1",
+		Title:    "key1",
+		Category: "login",
+		VaultID:  "vault-id",
+		Tags:     []string{"tag1"},
+		Fields: []onepassword.ItemField{
+			{
+				ID:        "field-1",
+				Title:     "username",
+				FieldType: onepassword.ItemFieldTypeConcealed,
+				Value:     "testuser",
+			},
+			{
+				ID:        "field-2",
+				Title:     "password",
+				FieldType: onepassword.ItemFieldTypeConcealed,
+				Value:     "testpass",
+			},
+		},
+	}
+	item2 := onepassword.Item{
+		ID:       "item-2",
+		Title:    "key2",
+		Category: "login",
+		VaultID:  "vault-id",
+		Tags:     []string{"tag2"},
+		Fields: []onepassword.ItemField{
+			{
+				ID:        "field-3",
+				Title:     "db-host",
+				FieldType: onepassword.ItemFieldTypeConcealed,
+				Value:     "testdb",
+			},
+		},
+	}
+	item3 := onepassword.Item{
+		ID:       "item-3",
+		Title:    "file1",
+		Category: "login",
+		VaultID:  "vault-id",
+		Tags:     []string{"tag1"},
+		Files: []onepassword.ItemFile{
+			{
+				Attributes: onepassword.FileAttributes{
+					Name: "certfile",
+					ID:   "file-id",
+				},
+				FieldID: "field-4",
+			},
+		},
+	}
+
+	createLister := func(items ...onepassword.Item) *statefulFakeLister {
+		fl := &statefulFakeLister{
+			items: make(map[string]onepassword.Item),
+			fileLister: &fakeFileLister{
+				readContent: []byte("content"),
+			},
+		}
+		for _, it := range items {
+			fl.items[it.ID] = it
+			fl.listAllResult = append(fl.listAllResult, onepassword.ItemOverview{
+				ID:      it.ID,
+				Title:   it.Title,
+				VaultID: it.VaultID,
+				Tags:    it.Tags,
+			})
+		}
+		return fl
+	}
+
+	tests := []struct {
+		name        string
+		ref         v1.ExternalSecretFind
+		want        map[string][]byte
+		assertError func(t *testing.T, err error)
+		client      func() *onepassword.Client
+	}{
+		{
+			name: "returns all fields and files from all items",
+			client: func() *onepassword.Client {
+				return &onepassword.Client{
+					SecretsAPI: &fakeClient{},
+					VaultsAPI:  &fakeClient{},
+					ItemsAPI:   createLister(item1, item2, item3),
+				}
+			},
+			assertError: func(t *testing.T, err error) {
+				require.NoError(t, err)
+			},
+			ref: v1.ExternalSecretFind{},
+			want: map[string][]byte{
+				"username": []byte("testuser"),
+				"password": []byte("testpass"),
+				"db-host":  []byte("testdb"),
+				"certfile": []byte("content"),
+			},
+		},
+		{
+			name: "filters items by path",
+			client: func() *onepassword.Client {
+				return &onepassword.Client{
+					SecretsAPI: &fakeClient{},
+					VaultsAPI:  &fakeClient{},
+					ItemsAPI:   createLister(item1, item2, item3),
+				}
+			},
+			assertError: func(t *testing.T, err error) {
+				require.NoError(t, err)
+			},
+			ref: v1.ExternalSecretFind{
+				Path: &item1.Title,
+			},
+			want: map[string][]byte{
+				"username": []byte("testuser"),
+				"password": []byte("testpass"),
+			},
+		},
+		{
+			name: "filters items by tag",
+			client: func() *onepassword.Client {
+				return &onepassword.Client{
+					SecretsAPI: &fakeClient{},
+					VaultsAPI:  &fakeClient{},
+					ItemsAPI:   createLister(item1, item2, item3),
+				}
+			},
+			assertError: func(t *testing.T, err error) {
+				require.NoError(t, err)
+			},
+			ref: v1.ExternalSecretFind{
+				Tags: map[string]string{"tag1": "true"},
+			},
+			want: map[string][]byte{
+				"username": []byte("testuser"),
+				"password": []byte("testpass"),
+				"certfile": []byte("content"),
+			},
+		},
+		{
+			name: "filters fields by name regex",
+			client: func() *onepassword.Client {
+				return &onepassword.Client{
+					SecretsAPI: &fakeClient{},
+					VaultsAPI:  &fakeClient{},
+					ItemsAPI:   createLister(item1, item2, item3),
+				}
+			},
+			assertError: func(t *testing.T, err error) {
+				require.NoError(t, err)
+			},
+			ref: v1.ExternalSecretFind{
+				Name: &v1.FindName{RegExp: "e"},
+			},
+			want: map[string][]byte{
+				"username": []byte("testuser"),
+				"certfile": []byte("content"),
+			},
+		},
+		{
+			name: "returns error on duplicate field name",
+			client: func() *onepassword.Client {
+				item2dup := onepassword.Item{
+					ID:       "item-2-dup",
+					Title:    "key2-dup",
+					Category: "login",
+					VaultID:  "vault-id",
+					Tags:     []string{"tag2"},
+					Fields: []onepassword.ItemField{
+						{
+							ID:        "field-3-dup",
+							Title:     "db-host",
+							FieldType: onepassword.ItemFieldTypeConcealed,
+							Value:     "testdb-dup",
+						},
+					},
+				}
+				return &onepassword.Client{
+					SecretsAPI: &fakeClient{},
+					VaultsAPI:  &fakeClient{},
+					ItemsAPI:   createLister(item2, item2dup),
+				}
+			},
+			assertError: func(t *testing.T, err error) {
+				require.ErrorContains(t, err, "found multiple labels with the same key")
+			},
+			ref: v1.ExternalSecretFind{},
+		},
+		{
+			name: "returns error on duplicate file name",
+			client: func() *onepassword.Client {
+				item3dup := onepassword.Item{
+					ID:       "item-3",
+					Title:    "file1-dup",
+					Category: "login",
+					VaultID:  "vault-id",
+					Tags:     []string{"tag1"},
+					Files: []onepassword.ItemFile{
+						{
+							Attributes: onepassword.FileAttributes{
+								Name: "certfile",
+								ID:   "file-id-dup",
+							},
+							FieldID: "field-4-dup",
+						},
+					},
+				}
+				return &onepassword.Client{
+					SecretsAPI: &fakeClient{},
+					VaultsAPI:  &fakeClient{},
+					ItemsAPI:   createLister(item3, item3dup),
+				}
+			},
+			assertError: func(t *testing.T, err error) {
+				require.ErrorContains(t, err, "found multiple labels with the same key")
+			},
+			ref: v1.ExternalSecretFind{},
+		},
+		{
+			name: "returns error if field name matches file name",
+			client: func() *onepassword.Client {
+				item2filedup := onepassword.Item{
+					ID:       "item-2-dup",
+					Title:    "key2-dup",
+					Category: "login",
+					VaultID:  "vault-id",
+					Tags:     []string{"tag1"},
+					Files: []onepassword.ItemFile{
+						{
+							Attributes: onepassword.FileAttributes{
+								Name: "db-host",
+								ID:   "file-id-dup",
+							},
+							FieldID: "field-3-dup",
+						},
+					},
+				}
+				return &onepassword.Client{
+					SecretsAPI: &fakeClient{},
+					VaultsAPI:  &fakeClient{},
+					ItemsAPI:   createLister(item2, item2filedup),
+				}
+			},
+			assertError: func(t *testing.T, err error) {
+				require.ErrorContains(t, err, "found multiple labels with the same key")
+			},
+			ref: v1.ExternalSecretFind{},
+		},
+		{
+			name: "returns error when list fails",
+			client: func() *onepassword.Client {
+				fl := &fakeLister{listAllResult: nil}
+				fl.listErr = errors.New("list error")
+				return &onepassword.Client{
+					SecretsAPI: &fakeClient{},
+					VaultsAPI:  &fakeClient{},
+					ItemsAPI:   fl,
+				}
+			},
+			assertError: func(t *testing.T, err error) {
+				require.ErrorContains(t, err, "list error")
+			},
+			ref: v1.ExternalSecretFind{},
+		},
+		{
+			name: "returns error when get fails",
+			client: func() *onepassword.Client {
+				fl := &fakeLister{
+					listAllResult: []onepassword.ItemOverview{{ID: "item-1", Title: "app-secrets", VaultID: "vault-id"}},
+					getErr:        errors.New("get error"),
+				}
+				return &onepassword.Client{
+					SecretsAPI: &fakeClient{},
+					VaultsAPI:  &fakeClient{},
+					ItemsAPI:   fl,
+				}
+			},
+			assertError: func(t *testing.T, err error) {
+				require.ErrorContains(t, err, "get error")
+			},
+			ref: v1.ExternalSecretFind{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &SecretsClient{
+				client:      tt.client(),
+				vaultPrefix: "op://vault/",
+			}
+			got, err := p.GetAllSecrets(t.Context(), tt.ref)
+			tt.assertError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestCachingGetAllSecrets(t *testing.T) {
+	fc := &fakeClient{listAllResult: []onepassword.VaultOverview{{ID: "vault-id", Title: "vault"}}}
+
+	item1 := onepassword.Item{
+		ID:       "item1aaaaaaaaaaaaaaaaaaaaa",
+		Title:    "key1",
+		Category: "login",
+		VaultID:  "vault-id",
+		Tags:     []string{"tag1"},
+		Fields: []onepassword.ItemField{
+			{
+				ID:        "field1aaaaaaaaaaaaaaaaaaaa",
+				Title:     "username",
+				FieldType: onepassword.ItemFieldTypeConcealed,
+				Value:     "testuser",
+			},
+			{
+				ID:        "field2aaaaaaaaaaaaaaaaaaaa",
+				Title:     "password",
+				FieldType: onepassword.ItemFieldTypeConcealed,
+				Value:     "testpass",
+			},
+		},
+	}
+	// item2 := onepassword.Item{
+	// 	ID:       "item2bbbbbbbbbbbbbbbbbbbbb",
+	// 	Title:    "key2",
+	// 	Category: "login",
+	// 	VaultID:  "vault-id",
+	// 	Tags:     []string{"tag2"},
+	// 	Fields: []onepassword.ItemField{
+	// 		{
+	// 			ID:        "field3bbbbbbbbbbbbbbbbbbbb",
+	// 			Title:     "db-host",
+	// 			FieldType: onepassword.ItemFieldTypeConcealed,
+	// 			Value:     "testdb",
+	// 		},
+	// 	},
+	// }
+	item3 := onepassword.Item{
+		ID:       "item3ccccccccccccccccccccc",
+		Title:    "file1",
+		Category: "login",
+		VaultID:  "vault-id",
+		Tags:     []string{"tag1"},
+		Files: []onepassword.ItemFile{
+			{
+				Attributes: onepassword.FileAttributes{
+					Name: "certfile",
+					ID:   "item3fileccccccccccccccccc",
+				},
+				FieldID: "field4cccccccccccccccccccc",
+			},
+		},
+	}
+
+	createLister := func(items ...onepassword.Item) *statefulFakeListerWithCounter {
+		fl := &statefulFakeListerWithCounter{
+			statefulFakeLister: &statefulFakeLister{
+				items: make(map[string]onepassword.Item),
+				fileLister: &fakeFileListerWithCounter{
+					fakeFileLister: &fakeFileLister{
+						readContent: []byte("content"),
+					},
+				},
+			},
+		}
+		for _, it := range items {
+			fl.items[it.ID] = it
+			fl.listAllResult = append(fl.listAllResult, onepassword.ItemOverview{
+				ID:      it.ID,
+				Title:   it.Title,
+				VaultID: it.VaultID,
+				Tags:    it.Tags,
+			})
+		}
+		return fl
+	}
+
+	newCachedClient := func(fl *statefulFakeListerWithCounter) *SecretsClient {
+		return &SecretsClient{
+			client:  &onepassword.Client{SecretsAPI: fc, VaultsAPI: fc, ItemsAPI: fl},
+			vaultID: "vault-id",
+			cache:   expirable.NewLRU[string, []byte](100, nil, time.Minute),
+		}
+	}
+
+	getCacheContents := func(p *SecretsClient) map[string][]byte {
+		keys := p.cache.Keys()
+		m := make(map[string][]byte, len(keys))
+		for _, k := range keys {
+			v, _ := p.cache.Peek(k)
+			m[k] = v
+		}
+
+		return m
+	}
+
+	debugCacheContents := func(p *SecretsClient) {
+		fmt.Printf("cache contents:\n")
+		for k, v := range getCacheContents(p) {
+			fmt.Printf("  %s: %s\n", k, string(v))
+		}
+	}
+
+	t.Run("second GetAllSecrets call does not re-fetch items from API", func(t *testing.T) {
+		fl := createLister(item1)
+		p := newCachedClient(fl)
+		find := v1.ExternalSecretFind{}
+
+		fmt.Println("BEFORE:")
+		debugCacheContents(p)
+
+		_, err := p.GetAllSecrets(t.Context(), find)
+		require.NoError(t, err)
+		assert.Equal(t, 1, fl.getCallCount, "first call should fetch from API")
+
+		_, err = p.GetAllSecrets(t.Context(), find)
+		require.NoError(t, err)
+		assert.Equal(t, 1, fl.getCallCount, "second call should use item cache, not re-fetch")
+
+		assert.Equal(t, 3, len(getCacheContents(p)), "cache should contain both fields from item1 after first call")
+
+		fmt.Println("AFTER:")
+		debugCacheContents(p)
+	})
+
+	t.Run("second GetAllSecrets call does not re-read files from API", func(t *testing.T) {
+		fl := createLister(item3)
+		ffl := fl.fileLister.(*fakeFileListerWithCounter)
+		p := newCachedClient(fl)
+		find := v1.ExternalSecretFind{}
+
+		fmt.Println("BEFORE:")
+		debugCacheContents(p)
+
+		_, err := p.GetAllSecrets(t.Context(), find)
+		require.NoError(t, err)
+		assert.Equal(t, 1, ffl.readCallCount, "first call should read file from API")
+
+		_, err = p.GetAllSecrets(t.Context(), find)
+		require.NoError(t, err)
+		assert.Equal(t, 1, ffl.readCallCount, "second call should use file cache, not re-read")
+
+		fmt.Println("AFTER:")
+		debugCacheContents(p)
+	})
+
+	t.Run("item fetched by GetAllSecrets is reused by GetSecretMap", func(t *testing.T) {
+		fl := &statefulFakeListerWithCounter{
+			statefulFakeLister: &statefulFakeLister{
+				items:      map[string]onepassword.Item{"item-1": item3},
+				fileLister: &fakeFileLister{},
+				listAllResult: []onepassword.ItemOverview{
+					{ID: "item-1", Title: "app-secrets", VaultID: "vault-id"},
+				},
+			},
+		}
+		p := newCachedClient(fl)
+
+		_, err := p.GetAllSecrets(t.Context(), v1.ExternalSecretFind{})
+		require.NoError(t, err)
+		assert.Equal(t, 1, fl.getCallCount, "GetAllSecrets fetches item once")
+
+		_, err = p.GetSecretMap(t.Context(), v1.ExternalSecretDataRemoteRef{Key: "item-1"})
+		require.NoError(t, err)
+		assert.Equal(t, 1, fl.getCallCount, "GetSecretMap should use cached item from GetAllSecrets")
+	})
 }
 
 func TestPushAllKeys(t *testing.T) {

@@ -52,14 +52,6 @@ type Provider struct {
 	clientCache *cache.Cache[esv1.SecretsClient]
 }
 
-// SecretsClient wraps a 1Password SDK client for a specific vault.
-type SecretsClient struct {
-	client      *onepassword.Client
-	vaultPrefix string
-	vaultID     string
-	cache       *expirable.LRU[string, []byte]
-}
-
 // NewClient will create a new client.
 func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube client.Client, namespace string) (esv1.SecretsClient, error) {
 	key := cache.Key{
@@ -122,7 +114,7 @@ func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube 
 			maxSize = config.Cache.MaxSize
 		}
 
-		sc.cache = expirable.NewLRU[string, []byte](maxSize, nil, ttl)
+		sc.Cache.cache = expirable.NewLRU[string, []byte](maxSize, nil, ttl)
 	}
 
 	p.clientCache.Add(store.GetObjectMeta().ResourceVersion, key, sc)
